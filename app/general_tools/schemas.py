@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas import CostUsage, GeneratedMediaFileInfo, TokenUsage
 
@@ -52,7 +52,7 @@ class GeneralState(BaseModel):
 
 class GeneralTextRequest(BaseModel):
     user_id: int
-    # Existing application tool/model id stored on models_converstaions.
+    # Existing application tool/model id stored on models_conversations.
     model_id: int
     # User-selected executable AI model from ai_models.
     selected_model_id: int
@@ -72,24 +72,52 @@ class GeneralTextRequest(BaseModel):
 
 
 class GeneralMediaParameters(BaseModel):
-    size: str = "1024x1024"
-    quality: Literal["low", "medium", "high"] = "medium"
-    count: int = 1
-    output_format: Literal["png", "jpg", "jpeg", "webp"] = "png"
+    model_config = ConfigDict(extra="allow")
+
+    size: str | None = None
+    quality: Literal["low", "medium", "high"] | None = None
+    count: int | None = None
+    output_format: Literal["png", "jpg", "jpeg", "webp"] | None = None
     negative_prompt: str | None = None
-    enhance_prompt: bool = True
+    enhance_prompt: bool | None = None
     seed: int | None = None
+    scale: Literal[2, 3, 4] | None = None
+    face_enhance: bool | None = None
+    quality_mode: Literal["faithful", "balanced", "quality"] | None = None
+    enhance_details: bool | None = None
+    realism: bool | None = None
+    width: int | None = None
+    height: int | None = None
+    duration: int | None = None
+    outpaint_top: int | None = None
+    outpaint_right: int | None = None
+    outpaint_bottom: int | None = None
+    outpaint_left: int | None = None
+    auto_crop: bool | None = None
 
     @field_validator("count")
     @classmethod
     def count_range(cls, value: int) -> int:
+        if value is None:
+            return value
         if not 1 <= value <= 4:
             raise ValueError("count must be between 1 and 4")
         return value
 
 
 class GeneralMediaState(BaseModel):
-    operation: Literal["image_generation"] = "image_generation"
+    operation: Literal[
+        "auto",
+        "image_generation",
+        "background_remove",
+        "image_upscale",
+        "image_edit",
+        "remove_element",
+        "restore",
+        "outpaint",
+        "resize",
+        "video_generation",
+    ] = "auto"
     model: str | None = None
     parameters: GeneralMediaParameters = Field(default_factory=GeneralMediaParameters)
 
@@ -106,15 +134,22 @@ class GeneralMediaRequest(BaseModel):
 
 
 class GeneralAudioParameters(BaseModel):
+    # Provider/model-specific fields declared in ai_models.parameter_schema are
+    # preserved here and validated dynamically in the router.
+    model_config = ConfigDict(extra="allow")
+
     language: str | None = None
-    include_segments: bool = False
+    include_segments: bool | None = None
     voice: str | None = None
     response_format: str | None = None
-    speed: float = 1.0
+    speed: float | None = None
+    provider_options: dict[str, Any] | None = None
 
     @field_validator("speed")
     @classmethod
     def speed_range(cls, value: float) -> float:
+        if value is None:
+            return value
         if not 0.25 <= value <= 4:
             raise ValueError("speed must be between 0.25 and 4")
         return value

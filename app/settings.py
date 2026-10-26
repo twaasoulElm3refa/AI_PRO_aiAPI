@@ -1,10 +1,10 @@
 from functools import lru_cache
-from pydantic import AliasChoices, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "AI Tools API"
+    APP_NAME: str = "AI Tools"
     APP_ENV: str = "production"
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 9000
@@ -67,39 +67,6 @@ class Settings(BaseSettings):
     # Retained from the existing .env for compatibility with callers/config.
     CHAT_MAX_CONTEXT_TOKENS: int = 3000
     CHAT_RESERVED_RESPONSE_TOKENS: int = 600
-
-    # Writer model. OPENROUTER_CHAT_MODEL remains accepted as a legacy alias.
-    OPENROUTER_WRITER_MODEL: str = Field(
-        default="qwen/qwen3.5-flash-02-23",
-        validation_alias=AliasChoices("OPENROUTER_WRITER_MODEL", "OPENROUTER_CHAT_MODEL"),
-    )
-    OPENROUTER_SUMMARIZER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_HEADLINE_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_HEADLINE_EXTRACTOR_MODEL: str = "openai/gpt-oss-20b:free" #"qwen/qwen3.5-flash-02-23"
-    OPENROUTER_PARAPHRASER_EXTRACTOR_MODEL: str = "openai/gpt-oss-20b:free" #"qwen/qwen3.5-flash-02-23"
-
-    OPENROUTER_PARAPHRASER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-
-    # Chat content tools. Override individual models in the environment when needed.
-    OPENROUTER_CONTENT_TOOL_EXTRACTOR_MODEL: str = "qwen/qwen3.5-flash-02-23"
-
-    OPENROUTER_SOCIAL_POST_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_EMAIL_WRITER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_SCRIPT_GENERATOR_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_PRODUCT_DESCRIPTION_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_PROMPT_GENERATOR_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_PROMPT_ENHANCER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_IDEA_GENERATOR_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_HOOK_GENERATOR_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_KEYWORD_GENERATOR_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_META_DESCRIPTION_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_CONTENT_ANALYZER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_CONTENT_OPTIMIZER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-
-    OPENROUTER_AI_DETECTOR_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_AI_HUMANIZER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_RESUME_BUILDER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_BUSINESS_NAME_MODEL: str = "qwen/qwen3.5-flash-02-23"
 
     # Resume Builder generated files. Keep this existing variable for resumes only.
     GENERATED_FILES_DIR: str = "/home/oghasahy/api.aiarabic.com/ai_service/storage/generated"
@@ -189,11 +156,6 @@ class Settings(BaseSettings):
     REPLICATE_POLL_TIMEOUT_SECONDS: float = 300.0
     REPLICATE_POLL_INTERVAL_SECONDS: float = 1.0
 
-    # AI Image Prompt Generator and YouTube Summarizer use the existing
-    # OpenRouter provider and conversation validation architecture.
-    OPENROUTER_IMAGE_PROMPT_MODEL: str = "qwen/qwen3.5-flash-02-23"
-    OPENROUTER_YOUTUBE_SUMMARIZER_MODEL: str = "qwen/qwen3.5-flash-02-23"
-
     # Dedicated OpenRouter audio endpoints. These use the same
     # OPENROUTER_API_KEY and OPENROUTER_BASE_URL as the text tools.
     OPENROUTER_STT_MODEL: str = "openai/whisper-large-v3"
@@ -256,9 +218,28 @@ class Settings(BaseSettings):
     GENERAL_TRANSLATION_DEFAULT_MODEL: str = "qwen/qwen3.5-35b-a3b"
     GENERAL_TOOLS_MAX_OUTPUT_TOKENS: int = 12000
     GENERAL_TOOLS_HISTORY_LIMIT: int = 12
-    # Use the exact MySQL table spelling. The current Laravel database uses the
-    # historical typo `models_converstaions`; override this if it is renamed.
-    MODELS_CONVERSATIONS_TABLE: str = "models_converstaions"
+
+    # Check-only credits guard. The Laravel backend owns the distributed
+    # per-user lock and performs the final debit after the response.
+    BILLING_ENFORCEMENT_ENABLED: bool = True
+    BILLING_CREDITS_PER_USD: int = 1_000_000
+    BILLING_SAFETY_MARGIN_PERCENT: float = 10.0
+    BILLING_MARKUP_MULTIPLIER: float = 1.0
+    BILLING_MIN_REQUIRED_CREDITS: int = 1
+    # Code execution remains disabled until an isolated worker/container is
+    # configured. Never point this at the API application's own checkout.
+    AGENT_SANDBOX_ENABLED: bool = False
+    AGENT_SANDBOX_PROVIDER: str = "docker"
+    AGENT_SANDBOX_WORKSPACE_ROOT: str = "/tmp/ai-agent-sandboxes"
+    AGENT_SANDBOX_TIMEOUT_SECONDS: int = 60
+    AGENT_SANDBOX_MEMORY_MB: int = 512
+    AGENT_SANDBOX_CPU_LIMIT: float = 1.0
+    AGENT_SANDBOX_NETWORK_ENABLED: bool = False
+    # Comma-separated trusted Python modules. Each module must expose
+    # register_agent_tools(registry) and can add tools independent of site routes.
+    AGENT_TOOL_MODULES: str = ""
+    # Application conversations for the new model-based tools.
+    MODELS_CONVERSATIONS_TABLE: str = "models_conversations"
     # JSON list of Runware models exposed by general-media. Configure exact AIR
     # identifiers from your Runware account; the first enabled item is default.
     GENERAL_RUNWARE_MODELS_JSON: str = (

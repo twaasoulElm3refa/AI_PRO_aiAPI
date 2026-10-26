@@ -9,11 +9,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
+from sqlalchemy import select
 
 from app.errors import ProviderError, ProviderOutputError
 from app.image_prompt_output import strip_hidden_reasoning
 from app.prompt_contracts import apply_common_system_guardrails
 from app.request_context import get_request_id
+from app.billing.context import get_current_db, mark_current_provider_call_started
+from app.billing.errors import BillingConfigurationError
+from app.models import AIModel
 from app.schemas import ChatMessage
 from app.settings import get_settings
 from app.tasks import MODEL_ROUTES
@@ -476,7 +480,7 @@ async def send_messages_with_model(
     Compatibility guarantees for the rest of the project:
       - same function name and arguments
       - same ProviderResult shape
-      - same existing settings keys
+      - legacy model roles resolve from ai_models instead of environment values
       - same response_format / response-healing / web-search behavior
 
     Important error handling:
@@ -494,12 +498,25 @@ async def send_messages_with_model(
     if provider != "openrouter":
         raise ValueError(f"Unsupported provider: {provider}")
 
-    model_env_key = route["model_env_key"]
-    model_name = str(model_override or getattr(settings, model_env_key, None) or "").strip()
+    model_name = str(model_override or "").strip()
     if not model_name:
-        raise ProviderError(
-            f"Missing model name for env key: {model_env_key}",
-            provider="openrouter",
+        context_db = get_current_db()
+        if context_db is not None:
+            catalog_model = context_db.execute(select(AIModel).where(
+                AIModel.provider == "openrouter",
+                AIModel.tool_key == model_key,
+                AIModel.operation == "text_generation",
+                AIModel.is_active.is_(True),
+                AIModel.is_available.is_(True),
+                AIModel.deleted_at.is_(None),
+            ).order_by(
+                AIModel.is_recommended.desc(), AIModel.sort_order, AIModel.id
+            )).scalars().first()
+            if catalog_model is not None:
+                model_name = str(catalog_model.provider_model_id or "").strip()
+    if not model_name:
+        raise BillingConfigurationError(
+            f"No active ai_models row configured for legacy model key {model_key}"
         )
 
     if not settings.OPENROUTER_API_KEY:
@@ -596,6 +613,7 @@ async def send_messages_with_model(
             started = time.monotonic()
 
             try:
+                mark_current_provider_call_started()
                 response = await client.post(url, json=payload, headers=headers)
             except httpx.HTTPError as exc:
                 elapsed = time.monotonic() - started
