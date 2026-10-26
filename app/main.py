@@ -89,8 +89,72 @@ from app.tasks import TASKS
 from app.request_context import reset_request_id, set_request_id
 from app.security import verify_internal_api_key
 from app.general_tools.router import router as general_tools_router
+from app.trends.router import router as trends_router
+from app.agents.router import router as agents_router
+from app.billing.errors import BillingError
+from app.billing.legacy import run_legacy_billable
 
 settings = get_settings()
+
+
+def _endpoint_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, BillingError):
+        return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+    return HTTPException(status_code=502, detail=str(exc))
+
+
+def _wrap_legacy_request_runner(runner, tool_key: str, operation: str):
+    """Wrap legacy `(db, request_model, request_id)` runners once, centrally."""
+    async def wrapped(db, req, request_id, *args, **kwargs):
+        return await run_legacy_billable(
+            db, user_id=req.user_id, sub_tool_id=req.sub_tool_id,
+            request_id=request_id, tool_key=tool_key, operation=operation,
+            request_payload=req,
+            call=lambda: runner(db, req, request_id, *args, **kwargs),
+        )
+    return wrapped
+
+
+def _wrap_legacy_keyword_runner(runner, tool_key: str, operation: str):
+    """Wrap legacy runners whose identity fields are keyword arguments."""
+    async def wrapped(db, *args, **kwargs):
+        return await run_legacy_billable(
+            db, user_id=int(kwargs["user_id"]),
+            sub_tool_id=int(kwargs["sub_tool_id"]),
+            request_id=str(kwargs["request_id"]),
+            tool_key=tool_key, operation=operation,
+            request_payload=kwargs,
+            call=lambda: runner(db, *args, **kwargs),
+        )
+    return wrapped
+
+
+# These names are local to main.py. General-model routes import the original
+# media runners directly, so wrapping here does not double-charge them.
+run_headline_chat = _wrap_legacy_request_runner(run_headline_chat, "headline_generator", "text_generation")
+run_paraphraser_chat = _wrap_legacy_request_runner(run_paraphraser_chat, "paraphraser", "text_generation")
+run_social_post_chat = _wrap_legacy_request_runner(run_social_post_chat, "social_post_generator", "text_generation")
+run_email_writer_chat = _wrap_legacy_request_runner(run_email_writer_chat, "email_writer", "text_generation")
+run_script_generator_chat = _wrap_legacy_request_runner(run_script_generator_chat, "script_generator", "text_generation")
+run_product_description_chat = _wrap_legacy_request_runner(run_product_description_chat, "product_description_generator", "text_generation")
+run_prompt_generator_chat = _wrap_legacy_request_runner(run_prompt_generator_chat, "prompt_generator", "text_generation")
+run_prompt_enhancer_chat = _wrap_legacy_request_runner(run_prompt_enhancer_chat, "prompt_enhancer", "text_generation")
+run_idea_generator_chat = _wrap_legacy_request_runner(run_idea_generator_chat, "idea_generator", "text_generation")
+run_hook_generator_chat = _wrap_legacy_request_runner(run_hook_generator_chat, "hook_generator", "text_generation")
+run_keyword_generator_chat = _wrap_legacy_request_runner(run_keyword_generator_chat, "keyword_generator", "text_generation")
+run_meta_description_chat = _wrap_legacy_request_runner(run_meta_description_chat, "meta_description_generator", "text_generation")
+run_content_analyzer_chat = _wrap_legacy_request_runner(run_content_analyzer_chat, "content_analyzer", "text_generation")
+run_content_optimizer_chat = _wrap_legacy_request_runner(run_content_optimizer_chat, "content_optimizer", "text_generation")
+run_ai_detector_chat = _wrap_legacy_request_runner(run_ai_detector_chat, "ai_detector", "text_generation")
+run_ai_humanizer_chat = _wrap_legacy_request_runner(run_ai_humanizer_chat, "ai_humanizer", "text_generation")
+run_business_name_chat = _wrap_legacy_request_runner(run_business_name_chat, "business_name_generator", "text_generation")
+run_image_generator = _wrap_legacy_request_runner(run_image_generator, "image_generator", "image_generation")
+run_youtube_summarizer = _wrap_legacy_request_runner(run_youtube_summarizer, "youtube_summarizer", "summarization")
+run_text_to_speech = _wrap_legacy_request_runner(run_text_to_speech, "text_to_speech", "text_to_speech")
+run_resume_builder_chat_upload = _wrap_legacy_keyword_runner(run_resume_builder_chat_upload, "resume_builder", "document_generation")
+run_background_remover = _wrap_legacy_keyword_runner(run_background_remover, "background_remover", "background_remove")
+run_image_upscaler = _wrap_legacy_keyword_runner(run_image_upscaler, "image_upscaler", "image_upscale")
+run_speech_to_text = _wrap_legacy_keyword_runner(run_speech_to_text, "speech_to_text", "speech_to_text")
 
 def _resolve_media_upload_request(
     *,
@@ -137,6 +201,8 @@ def _state_bool(value, default: bool = False) -> bool:
 
 app = FastAPI(title=settings.APP_NAME)
 app.include_router(general_tools_router)
+app.include_router(trends_router)
+app.include_router(agents_router)
 
 origins = (
     ["*"]
@@ -173,7 +239,11 @@ async def health():
         "status": "ok",
         "app": settings.APP_NAME,
         "env": settings.APP_ENV,
-        "db_write_mode": "disabled_fastapi_read_only",
+        "db_write_mode": (
+            "mysql_credits_check_only"
+            if settings.BILLING_ENFORCEMENT_ENABLED
+            else "disabled_fastapi_read_only"
+        ),
     }
 
 
@@ -214,14 +284,21 @@ def create_task_endpoint(task_key: str):
         _: None = Depends(verify_internal_api_key),
     ) -> TaskResponse:
         try:
-            return await run_task(db, task_key, req, request.state.request_id)
+            return await run_legacy_billable(
+                db, user_id=req.user_id, sub_tool_id=req.sub_tool_id,
+                request_id=request.state.request_id,
+                tool_key=task_key, operation="text_generation",
+                call=lambda: run_task(
+                    db, task_key, req, request.state.request_id
+                ),
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except httpx.HTTPStatusError as e:
             provider_text = e.response.text if e.response is not None else str(e)
             raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
         except Exception as e:
-            raise HTTPException(status_code=502, detail=str(e))
+            raise _endpoint_exception(e)
 
     return endpoint
 
@@ -245,7 +322,7 @@ async def headline_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -267,7 +344,7 @@ async def paraphraser_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -289,7 +366,7 @@ async def social_post_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -311,7 +388,7 @@ async def email_writer_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -333,7 +410,7 @@ async def script_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -355,7 +432,7 @@ async def product_description_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -377,7 +454,7 @@ async def prompt_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -399,7 +476,7 @@ async def prompt_enhancer_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -421,7 +498,7 @@ async def idea_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -443,7 +520,7 @@ async def hook_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -465,7 +542,7 @@ async def keyword_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -487,7 +564,7 @@ async def meta_description_generator_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -509,7 +586,7 @@ async def content_analyzer_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -531,7 +608,7 @@ async def content_optimizer_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -553,7 +630,7 @@ async def ai_detector_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -575,7 +652,7 @@ async def ai_humanizer_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -597,7 +674,7 @@ async def business_name_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -635,7 +712,7 @@ async def resume_builder_chat_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.get(
@@ -678,7 +755,7 @@ async def image_generator_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -724,7 +801,7 @@ async def background_remover_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -805,7 +882,7 @@ async def image_upscaler_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -827,7 +904,7 @@ async def youtube_summarizer_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -883,7 +960,7 @@ async def speech_to_text_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.post(
@@ -905,7 +982,7 @@ async def text_to_speech_endpoint(
         provider_text = e.response.text if e.response is not None else str(e)
         raise HTTPException(status_code=502, detail=f"Provider HTTP error: {provider_text}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _endpoint_exception(e)
 
 
 @app.get(

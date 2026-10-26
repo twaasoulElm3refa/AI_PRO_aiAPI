@@ -9,7 +9,12 @@ settings = get_settings()
 if not settings.DATABASE_URL.strip():
     raise RuntimeError("DATABASE_URL is required to start the API")
 
-if not settings.DATABASE_URL.lower().startswith(("mysql://", "mysql+pymysql://", "mariadb://", "mariadb+pymysql://")):
+if (
+    settings.APP_ENV.lower() != "test"
+    and not settings.DATABASE_URL.lower().startswith(
+        ("mysql://", "mysql+pymysql://", "mariadb://", "mariadb+pymysql://")
+    )
+):
     raise RuntimeError("DATABASE_URL must use the production MySQL/MariaDB database")
 
 engine = create_engine(

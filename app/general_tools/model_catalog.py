@@ -65,6 +65,24 @@ def _openrouter_price(pricing: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _openrouter_tts_price(provider_pricing: dict[str, Any], existing: dict | None) -> dict[str, Any]:
+    existing = existing if isinstance(existing, dict) else {}
+    if any(key in existing for key in (
+        "per_million_characters", "per_million_utf8_bytes", "per_character"
+    )):
+        return existing
+    try:
+        per_character = float(provider_pricing.get("completion") or 0.0)
+    except (TypeError, ValueError):
+        per_character = 0.0
+    return {
+        "currency": "USD",
+        "per_million_characters": per_character * 1_000_000,
+        "estimated": True,
+        "source": "openrouter_models_api",
+    }
+
+
 async def sync_openrouter_models(db: Session) -> dict[str, int]:
     """Refresh metadata/pricing only for OpenRouter rows already approved in DB."""
     settings = get_settings()
@@ -91,10 +109,31 @@ async def sync_openrouter_models(db: Session) -> dict[str, int]:
             model.provider_updated_at = now
             unavailable += 1
             continue
+        if model.operation == "text_to_speech" and not (model.parameter_schema or {}):
+            # OpenRouter requires a voice, and voice identifiers are model-specific.
+            # Do not re-enable catalog rows that would fall back to an incompatible
+            # global voice after a provider sync.
+            model.is_available = False
+            model.provider_updated_at = now
+            unavailable += 1
+            continue
         model.is_available = True
         model.name = str(item.get("name") or model.name)
         model.description = str(item.get("description") or model.description or "") or None
-        model.pricing = _openrouter_price(item.get("pricing") or {})
+        if model.operation == "text_to_speech":
+            model.pricing = _openrouter_tts_price(
+                item.get("pricing") or {}, model.pricing
+            )
+        else:
+            refreshed_pricing = _openrouter_price(item.get("pricing") or {})
+            existing_pricing = model.pricing if isinstance(model.pricing, dict) else {}
+            # Pipeline ceilings are operator policy, not provider catalog data.
+            # Preserve them when refreshing volatile provider rates.
+            if isinstance(existing_pricing.get("billing"), dict):
+                refreshed_pricing["billing"] = existing_pricing["billing"]
+            if existing_pricing.get("max_output_tokens") is not None:
+                refreshed_pricing["max_output_tokens"] = existing_pricing["max_output_tokens"]
+            model.pricing = refreshed_pricing
         model.capabilities = item.get("architecture") or model.capabilities
         model.provider_metadata = {
             "context_length": item.get("context_length"),

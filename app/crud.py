@@ -154,7 +154,7 @@ def get_existing_conversation_for_model(
     )
     if not conversation:
         raise ValueError(
-            "Model conversation not found. Create it in models_converstaions before calling FastAPI."
+            "Model conversation not found. Create it in models_conversations before calling FastAPI."
         )
     if int(conversation.model_id) != int(model_id):
         raise ValueError("Conversation model_id does not match request")

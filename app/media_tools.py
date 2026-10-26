@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import UploadFile
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.crud import get_existing_conversation_for_task
@@ -26,8 +27,10 @@ from app.generic_content_chat import calculate_content_tool_cost
 from app.errors import ProviderError, ProviderOutputError
 from app.json_utils import extract_json_object, object_response_format
 from app.media_storage import StoredMediaFile, media_download_url, save_media_bytes
+from app.models import AIModel
 from app.providers import ProviderResult, build_openrouter_headers, send_messages_with_model
 from app.request_context import get_request_id
+from app.billing.context import mark_current_provider_call_started
 from app.schemas import (
     ChatMessage,
     CostUsage,
@@ -84,6 +87,56 @@ def _provider_name(requested: str | None, default_value: str) -> str:
     return (requested or default_value or "").strip().lower()
 
 
+def _tts_catalog_cost(
+    db: Session, *, provider: str, model: str, text_value: str
+) -> tuple[float | None, dict[str, Any]]:
+    """Resolve legacy/general TTS cost when the raw audio response has no usage."""
+    normalized_model = str(model or "").strip()
+    if normalized_model.endswith(":free"):
+        return 0.0, {
+            "billing_source": "provider_free_model",
+            "cost_is_estimate": False,
+            "billable_units": len(str(text_value or "")),
+        }
+    catalog_model = db.execute(select(AIModel).where(
+        AIModel.provider == provider,
+        AIModel.provider_model_id == normalized_model,
+        AIModel.operation == "text_to_speech",
+        AIModel.is_active.is_(True),
+        AIModel.is_available.is_(True),
+        AIModel.deleted_at.is_(None),
+    ).order_by(AIModel.id.desc()).limit(1)).scalar_one_or_none()
+    if not catalog_model:
+        return None, {"billing_source": "unavailable", "cost_is_estimate": None}
+    pricing = catalog_model.pricing if isinstance(catalog_model.pricing, dict) else {}
+    text = str(text_value or "")
+    for key, units, divisor in (
+        ("per_million_characters", len(text), 1_000_000),
+        ("per_million_utf8_bytes", len(text.encode("utf-8")), 1_000_000),
+        ("per_character", len(text), 1),
+    ):
+        if pricing.get(key) is None:
+            continue
+        try:
+            total = (float(units) / float(divisor)) * float(pricing[key])
+        except (TypeError, ValueError):
+            continue
+        return round(total, 10), {
+            "billing_source": "ai_models_catalog_estimate",
+            "cost_is_estimate": True,
+            "pricing_key": key,
+            "pricing_rate": float(pricing[key]),
+            "billable_units": units,
+        }
+    if catalog_model.tier == "free":
+        return 0.0, {
+            "billing_source": "ai_models_free_tier",
+            "cost_is_estimate": False,
+            "billable_units": len(text),
+        }
+    return None, {"billing_source": "unavailable", "cost_is_estimate": None}
+
+
 def _media_file_info(stored: StoredMediaFile) -> GeneratedMediaFileInfo:
     return GeneratedMediaFileInfo(
         file_id=stored.file_id,
@@ -105,16 +158,36 @@ async def _read_upload(
     content_type = (upload.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream").lower()
     extension = Path(filename).suffix.lower()
 
-    if allowed_content_types and content_type not in allowed_content_types:
-        if not allowed_extensions or extension not in allowed_extensions:
-            raise ValueError(f"Unsupported upload type: {content_type or extension}")
-
     max_bytes = max(1, int(max_mb)) * 1024 * 1024
     data = await upload.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise ValueError(f"Uploaded file exceeds maximum size of {max_mb} MB")
     if not data:
         raise ValueError("Uploaded file is empty")
+
+    # Browsers and Postman can send a valid image as application/octet-stream,
+    # especially when the local filename has no extension. Detect only the
+    # image formats this API already allows; arbitrary binary files stay blocked.
+    detected_image_type = None
+    detected_extension = None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected_image_type, detected_extension = "image/png", ".png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        detected_image_type, detected_extension = "image/jpeg", ".jpg"
+    elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        detected_image_type, detected_extension = "image/webp", ".webp"
+
+    if content_type in {"application/octet-stream", "binary/octet-stream"} and detected_image_type:
+        content_type = detected_image_type
+        if extension not in (allowed_extensions or set()):
+            extension = detected_extension or extension
+
+    if allowed_content_types and content_type not in allowed_content_types:
+        if not allowed_extensions or extension not in allowed_extensions:
+            raise ValueError(
+                "Unsupported upload type: "
+                f"content_type={content_type or 'unknown'}, extension={extension or 'none'}"
+            )
     return data, filename, content_type
 
 
@@ -342,6 +415,7 @@ async def _runware_request(task: dict[str, Any]) -> list[dict[str, Any]]:
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=settings.MEDIA_PROVIDER_TIMEOUT_SECONDS) as client:
+        mark_current_provider_call_started()
         response = await client.post(settings.RUNWARE_BASE_URL, headers=headers, json=[task])
         try:
             response.raise_for_status()
@@ -389,6 +463,15 @@ async def _runware_image_bytes(item: dict[str, Any], default_content_type: str) 
 
 async def _generate_image_runware(req: ImageGeneratorRequest) -> tuple[list[bytes], str, dict[str, Any]]:
     settings = get_settings()
+    model = req.model or settings.RUNWARE_IMAGE_MODEL
+    provider_metadata = req.provider_metadata or {}
+    unsupported_parameters = {
+        str(item) for item in provider_metadata.get("unsupported_parameters", [])
+    }
+    # FLUX.2 Pro has a curated BFL schema and rejects diffusion-only controls.
+    # Keep this safe fallback even when provider_metadata has not been synced.
+    if model.startswith("bfl:5@"):
+        unsupported_parameters.update({"CFGScale", "steps", "negativePrompt"})
     width, height, actual_size = _runware_dimensions(req.size)
     output_format = (req.output_format or "png").strip().upper()
     if output_format == "JPEG":
@@ -400,12 +483,10 @@ async def _generate_image_runware(req: ImageGeneratorRequest) -> tuple[list[byte
         "taskType": "imageInference",
         "taskUUID": str(uuid.uuid4()),
         "deliveryMethod": "sync",
-        "model": req.model or settings.RUNWARE_IMAGE_MODEL,
+        "model": model,
         "positivePrompt": req.prompt,
         "width": width,
         "height": height,
-        "steps": settings.RUNWARE_IMAGE_STEPS,
-        "CFGScale": settings.RUNWARE_IMAGE_CFG_SCALE,
         "numberResults": req.count,
         "outputType": "base64Data",
         "outputFormat": output_format,
@@ -413,8 +494,19 @@ async def _generate_image_runware(req: ImageGeneratorRequest) -> tuple[list[byte
         "includeCost": True,
         "safety": {"checkContent": settings.RUNWARE_CHECK_CONTENT},
     }
-    if req.negative_prompt:
+    if "steps" not in unsupported_parameters:
+        task["steps"] = settings.RUNWARE_IMAGE_STEPS
+    if "CFGScale" not in unsupported_parameters:
+        task["CFGScale"] = settings.RUNWARE_IMAGE_CFG_SCALE
+    if req.negative_prompt and "negativePrompt" not in unsupported_parameters:
         task["negativePrompt"] = req.negative_prompt
+    provider_settings = provider_metadata.get("provider_settings")
+    if not isinstance(provider_settings, dict) and model.startswith("bfl:5@"):
+        provider_settings = {
+            "bfl": {"promptUpsampling": True, "safetyTolerance": 2}
+        }
+    if isinstance(provider_settings, dict) and provider_settings:
+        task["providerSettings"] = provider_settings
     if req.seed is not None:
         task["seed"] = int(req.seed)
 
@@ -434,12 +526,13 @@ async def _generate_image_runware(req: ImageGeneratorRequest) -> tuple[list[byte
         raise ValueError("Runware returned no generated image")
     costs = [float(item.get("cost") or 0) for item in results]
     return images, content_type, {
-        "model": req.model or settings.RUNWARE_IMAGE_MODEL,
+        "model": model,
         "task_uuid": task["taskUUID"],
         "requested_size": req.size,
         "actual_size": actual_size,
         "seeds": [item.get("seed") for item in results if item.get("seed") is not None],
         "provider_cost_usd": sum(costs),
+        "omitted_parameters": sorted(unsupported_parameters),
     }
 
 
@@ -480,6 +573,7 @@ async def _generate_image_openai(req: ImageGeneratorRequest) -> tuple[list[bytes
     }
     url = f"{settings.OPENAI_BASE_URL.rstrip('/')}/images/generations"
     async with httpx.AsyncClient(timeout=settings.MEDIA_PROVIDER_TIMEOUT_SECONDS) as client:
+        mark_current_provider_call_started()
         response = await client.post(url, json=payload, headers=headers)
         try:
             response.raise_for_status()
@@ -655,6 +749,7 @@ async def run_image_generator(
     elif provider == "openai":
         images, content_type, provider_meta = await _generate_image_openai(generation_req)
     elif provider == "huggingface":
+        mark_current_provider_call_started()
         images, content_type, provider_meta = await asyncio.to_thread(_hf_text_to_image_sync, generation_req)
     else:
         images, content_type, provider_meta = await _generate_image_comfyui(generation_req)
@@ -761,6 +856,7 @@ async def _remove_background_removebg(image_bytes: bytes, filename: str, content
     files = {"image_file": (filename, image_bytes, content_type)}
     data = {"size": settings.REMOVEBG_SIZE, "format": "png"}
     async with httpx.AsyncClient(timeout=settings.MEDIA_PROVIDER_TIMEOUT_SECONDS) as client:
+        mark_current_provider_call_started()
         response = await client.post(settings.REMOVEBG_API_URL, headers=headers, files=files, data=data)
         try:
             response.raise_for_status()
@@ -772,13 +868,15 @@ async def _remove_background_removebg(image_bytes: bytes, filename: str, content
 async def _remove_background_runware(
     image_bytes: bytes,
     content_type: str,
+    model_override: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     settings = get_settings()
+    model = model_override or settings.RUNWARE_BACKGROUND_REMOVER_MODEL
     task = {
         "taskType": "removeBackground",
         "taskUUID": str(uuid.uuid4()),
         "deliveryMethod": "sync",
-        "model": settings.RUNWARE_BACKGROUND_REMOVER_MODEL,
+        "model": model,
         "inputs": {"image": _bytes_to_data_uri(image_bytes, content_type)},
         "outputType": "base64Data",
         "outputFormat": "PNG",
@@ -789,7 +887,7 @@ async def _remove_background_runware(
     item = results[0]
     output, returned_type = await _runware_image_bytes(item, "image/png")
     return output, {
-        "model": settings.RUNWARE_BACKGROUND_REMOVER_MODEL,
+        "model": model,
         "task_uuid": task["taskUUID"],
         "provider_cost_usd": float(item.get("cost") or 0.0),
         "returned_content_type": returned_type,
@@ -805,9 +903,12 @@ async def run_background_remover(
     file: UploadFile,
     provider_override: str | None,
     request_id: str,
+    model_override: str | None = None,
+    validate_context: bool = True,
 ) -> MediaToolResponse:
     settings = get_settings()
-    _validate_context(db, user_id, sub_tool_id, conversation_uuid)
+    if validate_context:
+        _validate_context(db, user_id, sub_tool_id, conversation_uuid)
     image_bytes, original_filename, content_type = await _read_upload(
         file,
         max_mb=settings.MAX_IMAGE_UPLOAD_MB,
@@ -818,8 +919,10 @@ async def run_background_remover(
     provider = _provider_name(provider_override, settings.BACKGROUND_REMOVER_PROVIDER)
     provider_meta: dict[str, Any] = {}
     if provider == "runware":
-        output, provider_meta = await _remove_background_runware(image_bytes, content_type)
-        model = settings.RUNWARE_BACKGROUND_REMOVER_MODEL
+        output, provider_meta = await _remove_background_runware(
+            image_bytes, content_type, model_override
+        )
+        model = model_override or settings.RUNWARE_BACKGROUND_REMOVER_MODEL
     elif provider == "rembg":
         output = await asyncio.to_thread(_remove_background_rembg_sync, image_bytes)
         model = settings.REMBG_MODEL
@@ -984,6 +1087,7 @@ async def _run_runware_upscaler(
     quality_mode: str,
     enhance_details: bool,
     realism: bool,
+    model_override: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     settings = get_settings()
 
@@ -1000,7 +1104,10 @@ async def _run_runware_upscaler(
         or realism
         or face_enhance
     )
-    model = settings.RUNWARE_UPSCALER_ADVANCED_MODEL if use_advanced else settings.RUNWARE_UPSCALER_MODEL
+    model = model_override or (
+        settings.RUNWARE_UPSCALER_ADVANCED_MODEL
+        if use_advanced else settings.RUNWARE_UPSCALER_MODEL
+    )
     task: dict[str, Any] = {
         "taskType": "upscale",
         "taskUUID": str(uuid.uuid4()),
@@ -1049,9 +1156,12 @@ async def run_image_upscaler(
     enhance_details: bool | None,
     realism: bool | None,
     request_id: str,
+    model_override: str | None = None,
+    validate_context: bool = True,
 ) -> MediaToolResponse:
     settings = get_settings()
-    _validate_context(db, user_id, sub_tool_id, conversation_uuid)
+    if validate_context:
+        _validate_context(db, user_id, sub_tool_id, conversation_uuid)
     if scale not in {2, 3, 4}:
         raise ValueError("scale must be 2, 3, or 4")
 
@@ -1090,6 +1200,7 @@ async def run_image_upscaler(
             normalized_mode,
             resolved_enhance_details,
             resolved_realism,
+            model_override,
         )
         model = str(provider_meta.get("model") or settings.RUNWARE_UPSCALER_MODEL)
     elif provider in {"realesrgan", "local"}:
@@ -1107,6 +1218,7 @@ async def run_image_upscaler(
             "note": "Local Real-ESRGAN does not use the Runware detail/realism controls.",
         }
     elif provider == "replicate":
+        mark_current_provider_call_started()
         output, provider_meta = await asyncio.to_thread(
             _run_replicate_upscaler_sync,
             image_bytes,
@@ -1166,6 +1278,197 @@ async def run_image_upscaler(
         },
         cost=CostUsage(total_cost=float(provider_meta.get("provider_cost_usd") or 0.0))
         if provider_meta.get("provider_cost_usd") is not None else None,
+    )
+
+
+def _set_nested_value(target: dict[str, Any], dotted_path: str, value: Any) -> None:
+    current = target
+    parts = [part for part in str(dotted_path).split(".") if part]
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    if parts:
+        current[parts[-1]] = value
+
+
+async def run_general_runware_media_operation(
+    db: Session,
+    *,
+    user_id: int,
+    sub_tool_id: int,
+    conversation_uuid: str,
+    operation: str,
+    prompt: str,
+    file: UploadFile | None,
+    mask_file: UploadFile | None,
+    model: str,
+    parameters: dict[str, Any],
+    provider_metadata: dict[str, Any],
+    request_id: str,
+    additional_files: list[UploadFile] | None = None,
+) -> MediaToolResponse:
+    """Execute the general-media operations that use Runware model schemas."""
+    settings = get_settings()
+    needs_image = operation not in {"image_generation", "video_generation"}
+    image_data_uri = None
+    original_filename = None
+    if file is not None and getattr(file, "filename", None):
+        image_bytes, original_filename, image_content_type = await _read_upload(
+            file,
+            max_mb=settings.MAX_IMAGE_UPLOAD_MB,
+            allowed_content_types=set(_IMAGE_CONTENT_TYPES),
+            allowed_extensions={".png", ".jpg", ".jpeg", ".webp"},
+        )
+        _inspect_image_bytes(image_bytes, label="Uploaded image")
+        image_data_uri = _bytes_to_data_uri(image_bytes, image_content_type)
+    elif needs_image:
+        raise ValueError(f"file is required for {operation}")
+
+    reference_images = [image_data_uri] if image_data_uri else []
+    for extra_file in additional_files or []:
+        if extra_file is None or not getattr(extra_file, "filename", None):
+            continue
+        extra_bytes, _, extra_content_type = await _read_upload(
+            extra_file,
+            max_mb=settings.MAX_IMAGE_UPLOAD_MB,
+            allowed_content_types=set(_IMAGE_CONTENT_TYPES),
+            allowed_extensions={".png", ".jpg", ".jpeg", ".webp"},
+        )
+        _inspect_image_bytes(extra_bytes, label="Uploaded reference image")
+        reference_images.append(_bytes_to_data_uri(extra_bytes, extra_content_type))
+
+    mask_data_uri = None
+    if mask_file is not None and getattr(mask_file, "filename", None):
+        mask_bytes, _, mask_content_type = await _read_upload(
+            mask_file,
+            max_mb=settings.MAX_IMAGE_UPLOAD_MB,
+            allowed_content_types=set(_IMAGE_CONTENT_TYPES),
+            allowed_extensions={".png", ".jpg", ".jpeg", ".webp"},
+        )
+        _inspect_image_bytes(mask_bytes, label="Uploaded mask image")
+        mask_data_uri = _bytes_to_data_uri(mask_bytes, mask_content_type)
+    if operation == "remove_element" and not mask_data_uri:
+        raise ValueError("mask is required for remove_element (white=remove, black=keep)")
+
+    task_uuid = str(uuid.uuid4())
+    output_format = str(parameters.get("output_format") or "png").upper()
+    if output_format == "JPEG":
+        output_format = "JPG"
+    task: dict[str, Any] = {
+        "taskUUID": task_uuid,
+        "model": model,
+        "deliveryMethod": "sync",
+        "includeCost": True,
+    }
+    if operation in {"image_edit", "resize"}:
+        task.update({
+            "taskType": "imageInference",
+            "positivePrompt": prompt,
+            "inputs": {"referenceImages": reference_images},
+            "outputType": "base64Data",
+            "outputFormat": output_format,
+        })
+    elif operation == "remove_element":
+        task.update({
+            "taskType": "imageInference",
+            "positivePrompt": prompt,
+            "inputs": {"image": image_data_uri, "mask": mask_data_uri},
+            "outputType": "base64Data",
+            "outputFormat": output_format,
+        })
+    elif operation == "restore":
+        task.update({
+            "taskType": "upscale",
+            "upscaleFactor": int(parameters.get("scale") or 2),
+            "inputs": {"image": image_data_uri},
+            "settings": {"positivePrompt": prompt},
+            "outputType": "base64Data",
+            "outputFormat": output_format,
+        })
+    elif operation == "outpaint":
+        task.update({
+            "taskType": "imageInference",
+            "inputs": {"image": image_data_uri},
+            "outpaint": {
+                "top": int(parameters.get("outpaint_top") or 0),
+                "right": int(parameters.get("outpaint_right") or 0),
+                "bottom": int(parameters.get("outpaint_bottom") or 0),
+                "left": int(parameters.get("outpaint_left") or 0),
+            },
+            "settings": {"autoCrop": bool(parameters.get("auto_crop", True))},
+            "outputType": "base64Data",
+            "outputFormat": output_format,
+        })
+    elif operation == "video_generation":
+        task.update({
+            "taskType": "videoInference",
+            "positivePrompt": prompt,
+            "width": int(parameters.get("width") or 1280),
+            "height": int(parameters.get("height") or 720),
+            "duration": int(parameters.get("duration") or 6),
+            "outputType": "URL",
+        })
+        if image_data_uri:
+            task["inputs"] = {"frameImages": [{"image": image_data_uri, "frame": "first"}]}
+    else:
+        raise ValueError(f"Unsupported Runware general-media operation: {operation}")
+
+    if parameters.get("seed") is not None:
+        task["seed"] = int(parameters["seed"])
+    if parameters.get("width") is not None and operation != "video_generation":
+        task["width"] = int(parameters["width"])
+    if parameters.get("height") is not None and operation != "video_generation":
+        task["height"] = int(parameters["height"])
+
+    metadata = provider_metadata or {}
+    fixed_parameters = metadata.get("fixed_parameters")
+    if isinstance(fixed_parameters, dict):
+        for key, value in fixed_parameters.items():
+            _set_nested_value(task, key, value)
+    parameter_map = metadata.get("parameter_map")
+    if isinstance(parameter_map, dict):
+        for public_name, provider_path in parameter_map.items():
+            if public_name in parameters and parameters[public_name] is not None:
+                _set_nested_value(task, str(provider_path), parameters[public_name])
+
+    results = await _runware_request(task)
+    item = results[0]
+    provider_cost = float(item.get("cost") or 0.0)
+    if operation == "video_generation":
+        video_url = item.get("videoURL")
+        if not video_url:
+            raise ValueError(f"Runware returned no video URL: {item}")
+        output, returned_type = await _download_bytes(video_url)
+        content_type = returned_type if returned_type.startswith("video/") else "video/mp4"
+        extension = ".mp4"
+        filename = "ai-video.mp4"
+    else:
+        output, content_type = await _runware_image_bytes(item, f"image/{output_format.lower()}")
+        extension = {"PNG": ".png", "JPG": ".jpg", "WEBP": ".webp"}.get(output_format, ".png")
+        filename = f"general-media-{operation}{extension}"
+
+    stored = save_media_bytes(
+        output,
+        extension=extension,
+        filename=filename,
+        content_type=content_type,
+        metadata={
+            "tool": "general_media", "operation": operation,
+            "provider": "runware", "model": model, "task_uuid": task_uuid,
+            "original_filename": original_filename,
+        },
+    )
+    return MediaToolResponse(
+        tool="general_media", provider="runware", model=model,
+        user_id=user_id, sub_tool_id=sub_tool_id,
+        conversation_uuid=conversation_uuid,
+        message=f"{operation} completed successfully.",
+        files=[_media_file_info(stored)], count=1, request_id=request_id,
+        metadata={"operation": operation, "task_uuid": task_uuid, "provider_response": item},
+        cost=CostUsage(total_cost=provider_cost, currency="USD"),
     )
 
 
@@ -1315,6 +1618,7 @@ async def _fetch_supadata_transcript(
 
     timeout = httpx.Timeout(settings.SUPADATA_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout) as client:
+        mark_current_provider_call_started()
         response = await client.get(endpoint, headers=headers, params=params)
 
         if response.status_code not in {200, 202}:
@@ -1643,6 +1947,7 @@ async def _transcribe_openrouter(
     url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/audio/transcriptions"
     started = time.monotonic()
     async with httpx.AsyncClient(timeout=settings.MEDIA_PROVIDER_TIMEOUT_SECONDS) as client:
+        mark_current_provider_call_started()
         response = await client.post(url, headers=build_openrouter_headers(), json=payload)
         if settings.OPENROUTER_TRACE_ENABLED:
             logger.info(
@@ -1721,6 +2026,7 @@ async def _transcribe_openai(audio_bytes: bytes, filename: str, content_type: st
     headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}"}
     url = f"{settings.OPENAI_BASE_URL.rstrip('/')}/audio/transcriptions"
     async with httpx.AsyncClient(timeout=settings.MEDIA_PROVIDER_TIMEOUT_SECONDS) as client:
+        mark_current_provider_call_started()
         response = await client.post(url, headers=headers, data=data, files=files)
         try:
             response.raise_for_status()
@@ -1846,6 +2152,35 @@ async def run_speech_to_text(
     )
 
 
+async def _openrouter_generation_usage(
+    client: httpx.AsyncClient, generation_id: str | None
+) -> dict[str, Any]:
+    """Fetch authoritative cost/usage for raw-byte endpoints such as TTS."""
+    if not generation_id:
+        return {}
+    settings = get_settings()
+    url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/generation"
+    last_status = None
+    for delay in (0.0, 0.25, 0.75, 1.5):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            response = await client.get(
+                url, headers=build_openrouter_headers(), params={"id": generation_id}
+            )
+            last_status = response.status_code
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            return data if isinstance(data, dict) else {}
+        except (httpx.HTTPError, ValueError):
+            # Usage lookup must never discard successfully generated audio.
+            continue
+    return {"usage_lookup_status": last_status or "unavailable"}
+
+
 async def _text_to_speech_openrouter(req: TextToSpeechRequest) -> tuple[bytes, str, str, dict[str, Any]]:
     settings = get_settings()
     if not settings.OPENROUTER_API_KEY:
@@ -1865,9 +2200,12 @@ async def _text_to_speech_openrouter(req: TextToSpeechRequest) -> tuple[bytes, s
         "response_format": output_format,
         "speed": req.speed,
     }
+    if req.provider_options:
+        payload["provider"] = req.provider_options
     url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/audio/speech"
     started = time.monotonic()
     async with httpx.AsyncClient(timeout=settings.MEDIA_PROVIDER_TIMEOUT_SECONDS) as client:
+        mark_current_provider_call_started()
         response = await client.post(url, headers=build_openrouter_headers(), json=payload)
         if settings.OPENROUTER_TRACE_ENABLED:
             logger.info(
@@ -1890,13 +2228,14 @@ async def _text_to_speech_openrouter(req: TextToSpeechRequest) -> tuple[bytes, s
                 generation_id=response.headers.get("X-Generation-Id"),
             ) from exc
         data = response.content
+        generation_id = response.headers.get("X-Generation-Id")
         response_content_type = (response.headers.get("content-type") or "").lower()
         if not data:
             raise ProviderOutputError(
                 "OpenRouter text-to-speech returned an empty audio response",
                 provider="openrouter",
                 status_code=response.status_code,
-                generation_id=response.headers.get("X-Generation-Id"),
+                generation_id=generation_id,
             )
         if response_content_type and not response_content_type.startswith("audio/"):
             preview = data[:800].decode("utf-8", errors="replace")
@@ -1907,20 +2246,47 @@ async def _text_to_speech_openrouter(req: TextToSpeechRequest) -> tuple[bytes, s
                 status_code=response.status_code,
                 generation_id=response.headers.get("X-Generation-Id"),
             )
+        generation_usage = await _openrouter_generation_usage(client, generation_id)
 
     extension = ".mp3" if output_format == "mp3" else ".pcm"
     content_type = "audio/mpeg" if output_format == "mp3" else "audio/pcm"
-    provider_cost = response.headers.get("X-Cost") or response.headers.get("X-OpenRouter-Cost")
+    provider_cost = next((value for value in (
+        response.headers.get("X-Cost"),
+        response.headers.get("X-OpenRouter-Cost"),
+        generation_usage.get("total_cost"),
+        generation_usage.get("usage"),
+    ) if value is not None), None)
     try:
         provider_cost_value = float(provider_cost) if provider_cost is not None else None
     except (TypeError, ValueError):
         provider_cost_value = None
+    input_tokens = generation_usage.get("tokens_prompt")
+    if input_tokens is None:
+        input_tokens = generation_usage.get("native_tokens_prompt")
+    output_tokens = generation_usage.get("tokens_completion")
+    if output_tokens is None:
+        output_tokens = generation_usage.get("native_tokens_completion")
+    try:
+        total_tokens = (
+            int(input_tokens or 0) + int(output_tokens or 0)
+            if input_tokens is not None or output_tokens is not None else None
+        )
+    except (TypeError, ValueError):
+        input_tokens = output_tokens = total_tokens = None
     return data, extension, content_type, {
         "model": model,
         "voice": voice,
         "format": output_format,
         "provider_cost_usd": provider_cost_value,
-        "generation_id": response.headers.get("X-Generation-Id"),
+        "generation_id": generation_id,
+        "input_characters": len(req.text),
+        "billing_unit": "characters",
+        "usage_tokens": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        } if total_tokens is not None else None,
+        "generation_usage": generation_usage,
     }
 
 
@@ -1944,6 +2310,7 @@ async def _text_to_speech_openai(req: TextToSpeechRequest) -> tuple[bytes, str, 
     headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}", "Content-Type": "application/json"}
     url = f"{settings.OPENAI_BASE_URL.rstrip('/')}/audio/speech"
     async with httpx.AsyncClient(timeout=settings.MEDIA_PROVIDER_TIMEOUT_SECONDS) as client:
+        mark_current_provider_call_started()
         response = await client.post(url, headers=headers, json=payload)
         try:
             response.raise_for_status()
@@ -2016,6 +2383,20 @@ async def run_text_to_speech(
     else:
         raise ValueError("Unsupported text-to-speech provider. Use openrouter, openai, or piper")
 
+    resolved_cost = meta.get("provider_cost_usd")
+    if resolved_cost is not None:
+        billing_metadata = {
+            "billing_source": "provider_response",
+            "cost_is_estimate": False,
+        }
+    else:
+        resolved_cost, billing_metadata = _tts_catalog_cost(
+            db, provider=provider, model=str(meta.get("model") or ""),
+            text_value=req.text,
+        )
+        meta["provider_cost_usd"] = resolved_cost
+    meta.update(billing_metadata)
+
     stored = save_media_bytes(
         audio_bytes,
         extension=extension,
@@ -2035,6 +2416,8 @@ async def run_text_to_speech(
         count=1,
         request_id=request_id,
         metadata=meta,
-        cost=CostUsage(total_cost=float(meta.get("provider_cost_usd") or 0.0))
-        if meta.get("provider_cost_usd") is not None else None,
+        usage=TokenUsage(**meta["usage_tokens"])
+        if isinstance(meta.get("usage_tokens"), dict) else None,
+        cost=CostUsage(total_cost=float(resolved_cost), currency="USD")
+        if resolved_cost is not None else None,
     )

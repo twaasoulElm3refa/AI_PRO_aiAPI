@@ -1942,7 +1942,8 @@ class ImageGeneratorRequest(BaseModel):
     # Optional provider model override. General-media validates this against its
     # server-side allowlist before passing it here.
     model: Optional[str] = None
-    model: Optional[str] = None
+    # Trusted server-side model capabilities, populated from ai_models.
+    provider_metadata: Dict[str, Any] = Field(default_factory=dict)
     negative_prompt: Optional[str] = None
     enhance_prompt: Optional[bool] = None
     size: Optional[str] = None
@@ -2172,6 +2173,7 @@ class TextToSpeechState(BaseModel):
     voice: Optional[str] = None
     response_format: Optional[str] = None
     speed: float = 1.0
+    provider_options: Dict[str, Any] = Field(default_factory=dict)
     extra_options: List[str] = Field(default_factory=list)
     last_output: Optional[str] = None
 
@@ -2192,6 +2194,7 @@ class TextToSpeechRequest(BaseModel):
     voice: Optional[str] = None
     response_format: Optional[str] = None
     speed: Optional[float] = None
+    provider_options: Optional[Dict[str, Any]] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -2204,7 +2207,7 @@ class TextToSpeechRequest(BaseModel):
             data["text"] = text
             data["user_message"] = data.get("user_message") or text
 
-        for field_name in ("provider", "model", "voice", "response_format", "speed"):
+        for field_name in ("provider", "model", "voice", "response_format", "speed", "provider_options"):
             if data.get(field_name) is None and state.get(field_name) is not None:
                 data[field_name] = state.get(field_name)
 
